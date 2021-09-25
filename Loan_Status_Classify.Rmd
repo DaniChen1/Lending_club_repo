@@ -1,0 +1,947 @@
+
+---
+title: "Loan Status Classification"
+author: "Xiaodan Chen"
+date: "Mar 9, 2021"
+output:
+  html_notebook: default
+  pdf_document: default
+---
+
+
+## Abstract
+
+There are two parts in this project. In first part, I implemented five different Machine Learning Algorithms to classify the *Loan Status* from 2012 to 2014 of the *approved LendingClub loans* data. For each algorithm, I tuned the parameters to achieve the best performance. And comparing the results, I determined the *XGBoost* model to be the best model for building a classifier in this data set. In the second part, I used the *XGBoost* model to predict the *Loan Status* in 2015 and make the evaluation also. 
+
+## Part 1. Finding the Best Model
+
+## Introduction
+
+Before implementing the Machine Learning Algorithm, I cleaned the data set. The response variable *loan_status* had seven levels, and I was only interested in predicting whether the observations were fully paid or not. Therefore, I kept the 'fully paid' level and defined all the other levels as 'not fully paid'. I dropped the ID variables, categorical variables with large numbers of levels, and variables with high rates of missing values. I also removed the rows containing any missing values. Then I get a tidy data set having 416590 observations and 54 variables. I randomly selected a sample data set with 10000 observations, and I split the sample data set into a training and a testing data set using a 75-25 split. Then I developed the five models: *KNN*, *Random Forest*, *C5.0*, *Logistic Regression using regularization* and *XGBoost*. To improve the performance for each model, I tuned the parameters to achieve their best accuracy. At last, I compared and ranked the classification accuracy of each model.
+
+## Collect Data
+
+```{r message = FALSE}
+library(pacman)
+p_load(data.table, tidymodels, tidyverse, lubridate, visdat,
+       janitor, vip, knitr)
+```
+
+```{r eval=FALSE}
+df <- fread('data/accepted_2007_to_2018Q4.csv')
+
+df_2012_to_2014 <- df %>%
+  mutate(year = year(mdy(issue_d))) %>%
+  filter(year %in% c(2012, 2013, 2014))
+fwrite(df_2012_to_2014, 'data/accepted_2012_to_2014.csv')
+```
+
+```{r}
+df_2012_to_2014 <- fread('data/accepted_2012_to_2014.csv')
+```
+
+#### Use *clean_names* function to make all the variable names have lowercase letters and underscores. 
+```{r}
+df_2012_to_2014 <- df_2012_to_2014 %>% clean_names()
+```
+
+#### Table of the variable names.
+```{r, warning=FALSE}
+col <- colnames(df_2012_to_2014)
+variable_names <- data_frame(col[1:38], col[39:76], col[77:114], col[115:152])
+kable(variable_names)
+```
+
+#### Table of the number of rows and columns in the data frame.
+```{r}
+n_row <- nrow(df_2012_to_2014)
+n_col <- ncol(df_2012_to_2014)
+value <- c(n_row, n_col)
+name <- c('n_rows', 'n_columns')
+data_str <- data.frame(name, value)
+kable(data_str)
+```
+
+## Exploring and Preparing the Data
+
+#### Examine and drop variables with high rates of missing values. Using *skim()* function, I find out some variables contain large amounts of 'blank' values, which are not be recognized by the *is.na()* function.
+
+```{r eval=FALSE}
+skimr::skim(df_2012_to_2014)
+```
+
+```{r}
+lots_empty <- df_2012_to_2014 %>% 
+  select(c(emp_length, desc, next_pymnt_d, hardship_type:hardship_loan_status, 
+           debt_settlement_flag_date:settlement_date )) %>% 
+  names()
+
+lots_miss <- sapply(df_2012_to_2014, function(x){sum(is.na(x))}) > 20000
+lots_miss_col <- names(lots_miss)[lots_miss]
+
+df_2012_to_2014 <- df_2012_to_2014 %>% select(-all_of(lots_miss_col), -all_of(lots_empty))
+ncol(df_2012_to_2014)
+```
+
+#### Examine and drop id variables and categorical variables with large numbers of levels.
+```{r}
+id_feature <- sapply(df_2012_to_2014, function(x){length(unique(x))}) == 1 
+id_feature_col <- names(id_feature)[id_feature]
+lots_level_cat <- c('emp_title', 'title', 'url') 
+unique <- c('hardship_flag', 'pymnt_plan')
+meaning_less <- c('zip_code', 'earliest_cr_line', 'last_pymnt_d', 'last_credit_pull_d')
+
+df_2012_to_2014 <- df_2012_to_2014 %>% 
+  select(-c(all_of(id_feature_col), all_of(lots_level_cat), 
+            all_of(unique), all_of(meaning_less),
+            id, funded_amnt, funded_amnt_inv)) %>%
+  mutate_if(is.character, factor)
+
+ncol(df_2012_to_2014)
+```
+
+#### Summarize four numeric features. *loan_amnt*, *annual_inc*, *installment*, *int_rate*.
+```{r}
+df_2012_to_2014 %>% 
+  select(c(loan_amnt, annual_inc, installment, int_rate)) %>%
+  summary()
+```
+
+#### Summarize four categorical features. *grade*, *emp_length*, *home_ownership*, *purpose*.
+```{r}
+table(df_2012_to_2014$grade)
+table(df_2012_to_2014$emp_length)
+table(df_2012_to_2014$home_ownership)
+table(df_2012_to_2014$purpose)
+```
+
+The response variable *loan_status* has seven levels, and I am only interested in predicting whether the observations are fully paid or not. Therefore, I keep the 'fully paid' level and defined all the other levels as 'not fully paid'.
+```{r}
+table(df_2012_to_2014$loan_status)
+```
+
+```{r}
+df_2012_to_2014 <- df_2012_to_2014 %>%
+  mutate(loan_status = ifelse(loan_status == 'Fully Paid', 
+                              'fully_paid', 'not_full_paid')) 
+table(df_2012_to_2014$loan_status)
+```
+
+#### Remove the rows that containing missing values. And randomly take a sample data set with 10000 observations to implement the machine learning algorithms. There are 54 variables in this sample data set. 
+```{r}
+set.seed(999)
+df_2012_to_2014 <- df_2012_to_2014 %>% na.omit()
+n <- nrow(df_2012_to_2014)
+index <- sample(n, 10000)
+dfs <- df_2012_to_2014[index] 
+nrow(dfs)
+ncol(dfs)
+```
+
+#### Summarize the y-variable. The table shows there is 79.94% of people in the sample data set are 'fully_paid' for their *loan_status*. 
+```{r}
+dfs %>% count(loan_status) %>%
+  mutate(freq = n / sum(n))
+```
+
+#### Make the first split with 75% of the data being in the training data set.
+```{r}
+set.seed(999)
+dfs_split <- initial_split(dfs, prop = 0.75)
+
+train <- dfs_split %>% training() 
+test <- dfs_split %>% testing() 
+```
+
+#### Preparing the data. Create the recipe for ML model. Use step_nzv() to remove any columns that have very low variability.
+```{r}
+set.seed(999)
+train_recipe <- train %>% 
+  recipe(loan_status ~ .) %>%
+  step_nzv(all_predictors()) %>%
+  prep()
+
+train_prep <- juice(train_recipe)
+test_prep <- train_recipe %>% bake(test)
+```
+
+## Training a Model on the Data
+
+## *Model 0: null*
+
+#### The accuracy of the null model is 0.8036.
+```{r, warning=FALSE}
+mod_null <- null_model() %>%
+  set_mode('classification') %>%
+  fit(loan_status ~ ., data = train_prep) 
+```
+
+```{r}
+mod_null_r <- mod_null %>% predict(test_prep) %>%
+  bind_cols(test_prep) 
+  
+mod_null_r %>% metrics(truth = loan_status, 
+                       estimate = .pred_class)
+
+```
+```{r}
+mod_null_r %>% conf_mat(truth = loan_status, 
+                       estimate = .pred_class)
+```
+
+```{r}
+mod_null %>% predict(test_prep, type = 'prob') %>%
+  bind_cols(test_prep) %>% 
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+## *Model 1: KNN*
+
+#### Prepare the data, select all the numeric variables and make the normalization.
+```{r}
+t <- train %>% select(-loan_status)
+numeric <- unlist(lapply(t, is.numeric))
+categorical_var <- names(numeric[!numeric])
+
+recipe_knn <- train %>%
+  recipe(loan_status ~ .) %>%
+  step_rm(all_of(categorical_var)) %>%
+  step_normalize(all_predictors()) %>%
+  step_nzv(all_predictors()) %>%
+  prep()
+```
+
+#### Setup the model using *workflow*.
+```{r}
+mod_knn <- nearest_neighbor() %>% 
+  set_engine("kknn") %>%
+  set_mode("classification") 
+
+wf_knn <- workflow() %>%
+  add_recipe(recipe_knn) %>%
+  add_model(mod_knn)
+```
+
+#### Fit and evaluate the model using *vfold_cv* cross validation. 
+```{r, message=FALSE}
+set.seed(999)
+doParallel::registerDoParallel()
+
+folds <- vfold_cv(train , v = 10)
+
+fit_knn_rs <- wf_knn %>% 
+  fit_resamples(folds, 
+                control = control_resamples(save_pred = TRUE))
+```
+
+```{r}
+collect_metrics(fit_knn_rs)
+```
+
+## Evaluating Model Performance
+
+#### Estimate performance of the *testing* data. The accuracy is 0.8820, which is increased from the null model (0.8036).
+```{r}
+test_knn <- wf_knn %>%
+  last_fit(dfs_split)
+acc_knn <- collect_metrics(test_knn)
+acc_knn
+```
+
+```{r}
+collect_predictions(test_knn) %>%
+  conf_mat(loan_status, .pred_class)
+```
+
+```{r}
+collect_predictions(test_knn) %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+## Improving Model Performance
+
+#### Tuning and finding the best parameter K. 
+
+```{r}
+tune_knn <- 
+  nearest_neighbor(neighbors = tune()) %>%
+  set_engine("kknn") %>% 
+  set_mode("classification")
+```
+
+```{r}
+knn_wflow <-
+  workflow() %>%
+  add_recipe(recipe_knn) %>%
+  add_model(tune_knn)
+```
+
+```{r}
+set.seed(999)
+doParallel::registerDoParallel()
+
+knn_fit_rs <- 
+  knn_wflow %>% 
+  tune_grid(
+    resamples = folds,
+    grid = 20
+    )
+```
+
+#### The plots show the best K for the model should be 11. 
+```{r}
+autoplot(knn_fit_rs)
+```
+
+#### The table shows the same result from the plot above, and 11 should be the best k value for the *knn* algorithm in this data set. 
+```{r}
+knn_fit_rs %>% show_best("accuracy")
+```
+
+```{r}
+best_knn <- knn_fit_rs %>%
+  select_best("accuracy")
+best_knn 
+```
+#### The accuracy for the test data set is 0.906. The model performance does increase after tuning and finding the best parameter k = 11, comparing to that without tuning (0.8820).
+```{r}
+final_knn <- 
+  knn_wflow %>% 
+  finalize_workflow(best_knn) %>%
+  last_fit(dfs_split) 
+
+acc_knn <- final_knn %>% 
+    collect_metrics()
+acc_knn
+```
+
+```{r}
+collect_predictions(final_knn) %>%
+  conf_mat(loan_status, .pred_class)
+```
+
+```{r}
+collect_predictions(final_knn) %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+## *Model 2: Random Forest*
+
+#### Setup the model using *workflow*.
+```{r}
+mod_rf <- 
+  rand_forest(trees = 100) %>%
+  set_mode('classification') %>%
+  set_engine('ranger')
+
+workflow_rf <-
+  workflow() %>%
+  add_recipe(train_recipe) %>%
+  add_model(mod_rf)
+```
+
+#### Fit and evaluate the model using *vfold_cv* cross validation. 
+```{r, message=FALSE}
+set.seed(999)
+folds <- vfold_cv(train , v = 10)
+
+doParallel::registerDoParallel()
+fit_rf_rs <- workflow_rf %>%
+  fit_resamples(folds, 
+                control = control_resamples(save_pred = TRUE))
+```
+
+```{r}
+collect_metrics(fit_rf_rs)
+```
+
+## Evaluating Model Performance
+
+#### Estimate performance of the *testing* data. The accuracy is 0.9812 and the roc_auc is 0.9982, which increased a lot from the null model (0.8036).
+```{r}
+test_rf <- workflow_rf %>%
+  last_fit(dfs_split)
+acc_rf <- collect_metrics(test_rf)
+acc_rf
+```
+
+```{r}
+collect_predictions(test_rf) %>%
+  conf_mat(loan_status, .pred_class)
+```
+
+```{r}
+collect_predictions(test_rf) %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+## Improving Model Performance
+
+#### Tuning and finding the best parameter *mtry*, *min_n*. 
+```{r, message=FALSE}
+set.seed(999)
+folds <- vfold_cv(train , v = 10)
+
+rf_spec <- 
+  rand_forest(mtry = tune(), min_n = tune(), trees = 100) %>%
+  set_mode('classification') %>%
+  set_engine('ranger')
+
+rf_workflow <-
+  workflow() %>%
+  add_recipe(train_recipe) %>%
+  add_model(rf_spec)
+
+set.seed(999)
+doParallel::registerDoParallel()
+rf_fit_rs <- 
+  tune_grid(rf_workflow,
+            resamples = folds,
+            grid = 10)
+```
+
+#### The results show the best value of *mtry* should be 13, meaning 13 predictors will be randomly sampled at each split. And the best *min_n* is 14, meaning 14 data points in a node that is required for the node to be split further. 
+```{r}
+autoplot(rf_fit_rs)
+```
+  
+```{r}
+rf_fit_rs %>% show_best("accuracy")
+```
+
+```{r}
+best_rf <- rf_fit_rs %>%
+  select_best("accuracy")
+best_rf 
+```
+#### The accuracy for the test data set is 0.9844. The model performance does increase after tuning and finding the best parameter mtry = 13 and min_n = 14, comparing to that of without tuning (0.9812).
+```{r}
+final_rf <- 
+  rf_workflow %>% 
+  finalize_workflow(best_rf) %>%
+  last_fit(dfs_split) 
+
+acc_rf <- final_rf %>% 
+    collect_metrics()
+acc_rf
+```
+
+```{r}
+collect_predictions(final_rf) %>%
+  conf_mat(loan_status, .pred_class)
+```
+
+```{r}
+mod_rf_aoc <- collect_predictions(final_rf)
+mod_rf_aoc %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+#### Explore the feature importance.
+
+```{r}
+mod_rf_importance <- rand_forest(trees = 100) %>%
+  set_engine('ranger', importance = 'permutation') %>%
+  set_mode('classification') %>%
+  fit(loan_status ~ ., data = train_prep) %>%
+  vip(aesthetics = list(alpha = 0.8, fill = 'midnightblue'))
+
+mod_rf_importance
+```
+
+## *Model 3: Logistic Regression using regularization*
+
+#### Setup and fit the model.
+```{r}
+mod_glm <- logistic_reg(penalty = 0.001, mixture = 0.5) %>%
+  set_engine('glmnet') %>%
+  set_mode('classification') %>%
+  fit(loan_status ~ ., data = train_prep)
+```
+
+## Evaluating Model Performance
+
+#### Estimate performance of the *testing* data. The accuracy is 0.9776 and the roc_auc is 0.9269, which increased a lot from the null model (0.8036).
+```{r}
+mod_glm_r <- mod_glm %>%
+  predict(test_prep) %>%
+  bind_cols(test_prep)
+
+acc_glm <- mod_glm_r %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+acc_glm
+```
+```{r}
+mod_glm_r %>% conf_mat(truth = loan_status, estimate = .pred_class)
+```
+
+```{r}
+mod_glm_aoc <- mod_glm %>% predict(test_prep, type = 'prob') %>%
+  bind_cols(test_prep) 
+mod_glm_aoc %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+## Explore the feature importance.
+
+```{r}
+mod_glm_importance <- logistic_reg(penalty = 0.001, mixture = 0.5) %>%
+  set_engine('glmnet') %>%
+  set_mode('classification') %>%
+  fit(loan_status ~ ., data = train_prep) %>%
+  vip(aesthetics = list(alpha = 0.8, fill = 'midnightblue'))
+
+mod_glm_importance
+```
+
+## *Model 4: C5.0*
+
+#### Setup the model using *workflow*.
+```{r}
+set.seed(999)
+mod_c50 <- boost_tree(trees = 40) %>%
+  set_engine('C5.0') %>%
+  set_mode('classification')
+
+workflow_c50 <-
+  workflow() %>%
+  add_recipe(train_recipe) %>%
+  add_model(mod_c50)
+```
+
+#### Fit and evaluate the model using *vfold_cv* cross validation. 
+```{r, message=FALSE}
+set.seed(999)
+folds <- vfold_cv(train , v = 10)
+
+doParallel::registerDoParallel()
+fit_c50_rs <- workflow_c50 %>%
+  fit_resamples(folds, 
+                control = control_resamples(save_pred = TRUE))
+```
+
+```{r}
+collect_metrics(fit_c50_rs)
+```
+
+## Evaluating Model Performance
+
+#### Estimate performance of the *testing* data. The accuracy is 0.9892 and the roc_auc is 0.9982, which increased a lot from the null model.
+```{r}
+test_c50 <- workflow_c50 %>%
+  last_fit(dfs_split)
+acc_c50 <- collect_metrics(test_c50)
+acc_c50
+```
+
+```{r}
+collect_predictions(test_c50) %>%
+  conf_mat(loan_status, .pred_class)
+```
+
+```{r}
+collect_predictions(test_c50) %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+## Improving Model Performance
+
+#### Tuning and finding the best parameter *min_n*. 
+```{r}
+set.seed(999)
+folds <- vfold_cv(train , v = 10)
+
+c50_tune <- 
+  boost_tree(min_n = tune(), trees = 40) %>%
+  set_mode('classification') %>%
+  set_engine('C5.0')
+
+c50_workflow <-
+  workflow() %>%
+  add_recipe(train_recipe) %>%
+  add_model(c50_tune)
+```
+
+```{r}
+set.seed(999)
+doParallel::registerDoParallel()
+c50_fit_rs <- 
+  tune_grid(c50_workflow,
+            resamples = folds,
+            grid = 10)
+```
+
+#### The results show the best *min_n* is 31, meaning 31 data points in a node that is required for the node to be split further. 
+```{r}
+autoplot(c50_fit_rs)
+```
+  
+```{r}
+c50_fit_rs %>% show_best("accuracy")
+```
+
+```{r}
+best_c50 <- c50_fit_rs %>%
+  select_best("accuracy")
+best_c50
+```
+
+#### The accuracy for the test data set is 0.9900 and the roc_auc is 0.9991. The model performance does increase after tuning and finding the best parameter min_n = 31, comparing to those of without tuning (0.9892, 0.9982).
+```{r}
+final_c50 <- 
+  c50_workflow %>% 
+  finalize_workflow(best_c50) %>%
+  last_fit(dfs_split) 
+
+acc_c50 <- final_c50 %>% 
+    collect_metrics()
+acc_c50
+```
+
+```{r}
+collect_predictions(final_c50) %>%
+  conf_mat(loan_status, .pred_class)
+```
+
+```{r}
+mod_c50_aoc <- collect_predictions(final_c50)
+mod_c50_aoc %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+#### Explore the feature importance.
+
+```{r}
+mod_c50_importance <- boost_tree(trees = 40) %>%
+  set_engine('C5.0', importance = 'permutation') %>%
+  set_mode('classification') %>%
+  fit(loan_status ~ ., data = train_prep) %>%
+  vip(aesthetics = list(alpha = 0.8, fill = 'midnightblue'))
+
+mod_c50_importance
+```
+
+## *Model 5: XGBoost*
+
+#### Setup the model using *workflow*.
+```{r}
+set.seed(999)
+
+mod_xgb <- 
+  boost_tree(trees = 30) %>%
+  set_mode('classification') %>%
+  set_engine('xgboost')
+
+workflow_xgb <-
+  workflow() %>%
+  add_recipe(recipe_knn) %>%
+  add_model(mod_xgb)
+```
+
+#### Fit and evaluate the model using *vfold_cv* cross validation. 
+```{r, message=FALSE}
+set.seed(999)
+folds <- vfold_cv(train , v = 10)
+
+doParallel::registerDoParallel()
+fit_xgb_rs <- workflow_xgb %>%
+  fit_resamples(resamples = folds,
+                control = control_resamples(save_pred = TRUE))
+```
+
+```{r}
+collect_metrics(fit_xgb_rs)
+```
+
+## Evaluating Model Performance
+
+Estimate performance of the *testing* data. The accuracy is 0.9900 and the roc_auc is 0.9992, which increased a lot from the null model (0.8036).
+```{r}
+test_xgb <- workflow_xgb %>%
+  last_fit(dfs_split)
+acc_xgb <- collect_metrics(test_xgb)
+acc_xgb
+```
+
+```{r}
+collect_predictions(test_xgb) %>%
+  conf_mat(loan_status, .pred_class)
+```
+
+```{r}
+collect_predictions(test_xgb) %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+## Improving Model Performance
+
+#### Tuning and finding the best parameter *tree_depth*, *min_n*, *loss_reduction*, *sample_size*, *mtry*. 
+```{r}
+set.seed(999)
+xgb_mod <- 
+  boost_tree(trees = 30, tree_depth = tune(), min_n = tune(), loss_reduction = tune(),
+             sample_size = tune(), mtry = tune()) %>%
+  set_mode('classification') %>%
+  set_engine('xgboost')
+
+xgb_workflow <-
+  workflow() %>%
+  add_recipe(recipe_knn) %>%
+  add_model(xgb_mod)
+```
+
+```{r}
+xgb_grid <- grid_latin_hypercube(
+  tree_depth(),
+  min_n(),
+  loss_reduction(),
+  sample_size = sample_prop(),
+  finalize(mtry(), train),
+  size = 10
+)
+```
+
+```{r, warning=FALSE, message=FALSE}
+set.seed(999)
+folds <- vfold_cv(train , v = 10)
+
+doParallel::registerDoParallel()
+xgb_fit_rs <- xgb_workflow %>%
+  tune_grid(xgb_workflow,
+          resamples = folds,
+          grid = xgb_grid)
+```
+
+```{r}
+autoplot(xgb_fit_rs)
+```
+  
+```{r}
+xgb_fit_rs %>% show_best("accuracy")
+```
+
+The best combination of parameters are shown below. 
+```{r}
+best_xgb <- xgb_fit_rs %>%
+  select_best("accuracy")
+best_xgb
+```
+
+The accuracy for the test data set is 0.986. The model performance does not increase after tuning and finding the best parameters. The accuracy remains very close to the one without tuning. 
+```{r}
+final_xgb <- 
+  workflow_xgb %>% 
+  finalize_workflow(best_xgb) %>%
+  last_fit(dfs_split) 
+
+acc_xgb <- final_xgb %>% 
+    collect_metrics()
+acc_xgb
+```
+
+```{r}
+collect_predictions(final_xgb) %>%
+  conf_mat(loan_status, .pred_class)
+```
+
+```{r}
+mod_xgb_aoc <- collect_predictions(final_xgb)
+mod_xgb_aoc %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+#### Explore the feature importance.
+```{r, warning=FALSE, message=FALSE}
+mod_xgb_importance <- boost_tree(trees = 30) %>%
+  set_mode('classification') %>%
+  set_engine('xgboost', importance = 'permutation')  %>%
+  fit(loan_status ~ ., data = train_prep) %>%
+  vip(aesthetics = list(alpha = 0.8, fill = 'midnightblue'))
+
+mod_xgb_importance
+```
+
+## Compare performance among the five models.
+```{r}
+collect_predictions(final_knn) %>%
+  mutate(model = 'kknn') %>%
+  bind_rows(mod_c50_aoc %>% mutate(model = 'c50')) %>%
+  bind_rows(mod_rf_aoc %>% mutate(model = 'random forest')) %>%
+  bind_rows(mod_glm_aoc %>% mutate(model = 'glmnet')) %>%
+  bind_rows(mod_xgb_aoc %>% mutate(model = 'XGBoost')) %>%
+  group_by(model) %>%
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+```{r, message=FALSE}
+acc_knn %>% rename(knn = .estimate, metrics = .metric) %>%
+  bind_cols(acc_c50 %>% rename(c50 = .estimate)) %>%
+  bind_cols(acc_rf %>% rename(random_forest = .estimate)) %>%
+  bind_cols(acc_glm %>% rename(glmnet = .estimate)) %>%
+  bind_cols(acc_xgb %>% rename(XGBoost = .estimate)) %>%
+  select(metrics, XGBoost, c50, random_forest, glmnet, knn)
+```
+
+For most models, the accuracy does increase after tuning the parameters. It increased from 0.882 to 0.906 for *KNN*, from 0.981 to 0.985 for *Random Forest* and from 0.989 to 0.990 for *C5.0*. And comparing the performance for each model, all *C50*, *XGBoost*, and *Random Forest* models are doing well. But the *XGBoost* should be the best model with an accuracy of 0.990 and receiver operator curve is 0.999. Therefore, I will choose the *XBGoost* model to predict any new data.
+
+## Part 2.
+
+I filtered the data from 2012 to 2015 and made a similar data cleaning from the project. Then I got a tidy data set with 820120 observations and 58 variables. To predict the observations in 2015, I used the same training data set that I used in the project's five models. And I randomly selected 10% of the data in 2015 to make the predictions. Therefore, the data size of training data is 7500 and testing data is 41659. I would use these data to implement the *XGBoost* model and see how well the performance.
+
+## Collect Data
+
+```{r eval=FALSE}
+df_2012_to_2015 <- df %>%
+  mutate(year = year(mdy(issue_d))) %>%
+  filter(year %in% c(2012, 2013, 2014, 2015))
+fwrite(df_2012_to_2015, 'data/accepted_2012_to_2015.csv')
+```
+
+```{r}
+df_2012_to_2015 <- fread('data/accepted_2012_to_2015.csv')
+```
+
+## Preparing the Data
+
+#### Similar process as I did in part 1. 
+
+```{r}
+df_2012_to_2015 <- df_2012_to_2015 %>% clean_names()
+
+lots_empty <- df_2012_to_2015 %>% 
+  select(c(emp_length, desc, next_pymnt_d, verification_status_joint,
+           hardship_type:hardship_loan_status, 
+           debt_settlement_flag_date:settlement_date )) %>% 
+  names()
+
+lots_miss <- sapply(df_2012_to_2015, function(x){sum(is.na(x))}) > 20000
+lots_miss_col <- names(lots_miss)[lots_miss]
+
+df_2012_to_2015 <- df_2012_to_2015 %>% select(-all_of(lots_miss_col), -all_of(lots_empty))
+
+id_feature <- sapply(df_2012_to_2015, function(x){length(unique(x))}) == 1 
+id_feature_col <- names(id_feature)[id_feature]
+lots_level_cat <- c('emp_title', 'title', 'url') 
+unique <- c('hardship_flag', 'pymnt_plan')
+meaning_less <- c('zip_code', 'earliest_cr_line', 'last_pymnt_d', 'last_credit_pull_d')
+
+df_2012_to_2015 <- df_2012_to_2015%>% 
+  select(-c(all_of(id_feature_col), all_of(lots_level_cat), 
+            all_of(unique), all_of(meaning_less),
+            id, funded_amnt, funded_amnt_inv)) %>%
+  mutate_if(is.character, factor)
+```
+
+#### The response variable has 7 levels, and I am only interested to predict whether the observations fully paid or not. Therefore, I keep the 'fully paid' level and defined all the other levels to be 'not fully paid'.
+
+```{r}
+df_2012_to_2015 <- df_2012_to_2015 %>%
+  mutate(loan_status = ifelse(loan_status == 'Fully Paid', 
+                              'fully_paid', 'not_full_paid')) %>%
+  na.omit()
+
+nrow(df_2012_to_2015)
+table(df_2012_to_2015$loan_status)
+```
+
+#### Take the same training data set as the priors five models.     
+#### Randomly take 10% of the data in 2015 to do prediction and evaluation. 
+
+```{r}
+df_2012_to_2014 <- df_2012_to_2015 %>% 
+  filter(year %in% c(2012, 2013, 2014))
+n <- nrow(df_2012_to_2014)
+
+set.seed(999)
+index <- sample(n, 10000)
+dfs <- df_2012_to_2014[index] 
+
+set.seed(999)
+dfs_split <- initial_split(dfs, prop = 0.75)
+train <- dfs_split %>% training() 
+```
+
+```{r}
+df_2015 <- df_2012_to_2015 %>% 
+  filter(year == 2015)
+n <- nrow(df_2015)
+
+set.seed(999)
+index <- sample(n, 0.1*n)
+test <- df_2015[index] 
+```
+
+#### Preparing the data. Create the recipe for ML model. Use step_nzv() to remove any columns that have very low variability.
+
+```{r}
+set.seed(999)
+train_recipe <- train %>% 
+  recipe(loan_status ~ .) %>%
+  step_nzv(all_predictors()) %>%
+  prep()
+
+train_prep <- juice(train_recipe)
+test_prep <- train_recipe %>% bake(test)
+```
+
+## *Training Model 3: C5.0*
+
+#### Setup the model using the same parameters from the *XGBoost* model that I already done.
+
+```{r}
+set.seed(999)
+mod_xgb_f <- boost_tree(trees = 40, mtry = 48, min_n = 6, tree_depth = 11) %>%
+  set_engine('xgboost') %>%
+  set_mode('classification') %>%
+  fit(loan_status ~ ., data = train_prep)
+```
+
+## Evaluating Model Performance
+
+#### Estimate performance of the *testing* data. The accuracy is 0.983, which is a very good estimate.
+
+```{r}
+mod_xgb_m <- mod_xgb_f %>%
+  predict(test_prep) %>%
+  bind_cols(test_prep) 
+
+acc_xgb_f <- mod_xgb_m %>% 
+  metrics(truth = loan_status, estimate = .pred_class)
+acc_xgb_f
+```
+```{r}
+mod_xgb_m %>% conf_mat(truth = loan_status, 
+                        estimate = .pred_class)
+```
+
+```{r}
+mod_xgb_aoc <- mod_xgb_f %>% predict(test_prep, type = 'prob') %>%
+  bind_cols(test_prep) 
+
+mod_xgb_aoc %>% 
+  roc_curve(loan_status, .pred_fully_paid) %>%
+  autoplot()
+```
+
+## Conclusions  
+
+Use the data from 2012 to 2014 to train the *XGBoost* model and predict the observations in 2015. The results show it has a very good performance with accuracy of 0.983.
+
+
+
+
+
+
+
+
+
